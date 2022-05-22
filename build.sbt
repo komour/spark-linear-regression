@@ -14,7 +14,7 @@ libraryDependencies ++= Seq(
     "org.apache.spark" %% "spark-sql" % sparkVersion,
     "org.apache.spark" %% "spark-mllib" % sparkVersion,
     "org.scalanlp" %% "breeze" % breezeVersion,
-    "org.scalanlp" %% "breeze-viz" % breezeVersion,
-
-    "org.scalatest" %% "scalatest" % "3.2.12" % "test" withSources(),
+    "org.scalanlp" %% "breeze-viz" % breezeVersion
 )
+
+libraryDependencies += ("org.scalatest" %% "scalatest" % "3.2.2" % "test" withSources())

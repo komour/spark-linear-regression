@@ -6,8 +6,7 @@ import org.apache.spark.ml.feature.VectorAssembler
 import org.apache.spark.ml.linalg.{VectorUDT, Vector => MlVector, Vectors => MlVectors}
 import org.apache.spark.ml.param.shared.{HasMaxIter, HasTol}
 import org.apache.spark.ml.param.{DoubleParam, Param, ParamMap}
-import org.apache.spark.ml.util.{DefaultParamsReadable, DefaultParamsReader, DefaultParamsWritable, DefaultParamsWriter,
-  Identifiable, MLReadable, MLReader, MLWritable, MLWriter, SchemaUtils}
+import org.apache.spark.ml.util._
 import org.apache.spark.ml.{Estimator, Model, PredictorParams}
 import org.apache.spark.mllib.linalg.{Vectors => MllibVectors}
 import org.apache.spark.mllib.stat.MultivariateOnlineSummarizer
@@ -17,129 +16,143 @@ import org.apache.spark.sql.{DataFrame, Dataset, Encoder}
 
 trait LinearRegressionParams extends PredictorParams with HasMaxIter with HasTol {
 
-  val learningRate: Param[Double] = new DoubleParam(this, "learningRate", "learning rate")
+    val learningRate: Param[Double] = new DoubleParam(this, "learningRate", "Learning rate")
 
-  def getLearningRate: Double = $(learningRate)
+    def getLearningRate: Double = $(learningRate)
 
-  def setLearningRate(value: Double): this.type = set(learningRate, value)
+    def setLearningRate(value: Double): this.type = set(learningRate, value)
 
-  def setFeaturesCol(value: String): this.type = set(featuresCol, value)
+    setDefault(learningRate -> 0.05)
 
-  def setPredictionCol(value: String): this.type = set(predictionCol, value)
+    def setMaxIter(value: Int): this.type = set(maxIter, value)
 
-  def setLabelCol(value: String): this.type = set(labelCol, value)
+    setDefault(maxIter -> 100000)
 
-  def setMaxIter(value: Int): this.type = set(maxIter, value)
+    def setTol(value: Double): this.type = set(tol, value)
 
-  def setTol(value: Double): this.type = set(tol, value)
+    setDefault(tol -> 0.0000001)
 
-  setDefault(learningRate -> 0.05, maxIter -> 1e5.toInt, tol -> 1e-7)
+    def setPredictionCol(value: String): this.type = set(predictionCol, value)
 
-  protected def validateAndTransformSchema(schema: StructType): StructType = {
-    SchemaUtils.checkColumnType(schema, $(featuresCol), new VectorUDT())
+    def setLabelCol(value: String): this.type = set(labelCol, value)
 
-    if (schema.fieldNames.contains($(predictionCol))) {
-      SchemaUtils.checkColumnType(schema, $(predictionCol), DoubleType)
-      schema
-    } else {
-      SchemaUtils.appendColumn(schema, schema($(featuresCol)).copy(name = $(predictionCol)))
+    def setFeaturesCol(value: String): this.type = set(featuresCol, value)
+
+    protected def validateAndTransform(schema: StructType): StructType = {
+        SchemaUtils.checkColumnType(schema, $(featuresCol), new VectorUDT())
+
+        if (schema.fieldNames.contains($(predictionCol)) == false) {
+            SchemaUtils.appendColumn(schema, schema($(featuresCol)).copy(name = $(predictionCol)))
+        } else {
+            SchemaUtils.checkColumnType(schema, $(predictionCol), DoubleType)
+
+            return schema
+        }
     }
-  }
 }
 
 class LinearRegression(override val uid: String)
-  extends Estimator[LinearRegressionModel] with LinearRegressionParams with DefaultParamsWritable {
+    extends Estimator[SimpleLinearRegressionModel] with LinearRegressionParams with DefaultParamsWritable {
 
-  def this() = this(Identifiable.randomUID("linearRegression"))
+    def this() = this(Identifiable.randomUID("linearRegression"))
 
-  override def fit(dataset: Dataset[_]): LinearRegressionModel = {
+    override def copy(extra: ParamMap): LinearRegression = defaultCopy(extra)
 
-    implicit val encoder: Encoder[MlVector] = ExpressionEncoder()
+    override def transformSchema(schema: StructType): StructType = validateAndTransform(schema)
 
-    val vectors = {
-      val vectorColumn = "result column"
-      val assembler = new VectorAssembler().setInputCols(Array($(featuresCol), $(labelCol))).setOutputCol(vectorColumn)
-      assembler.transform(dataset).select(vectorColumn).as[MlVector]
+    override def fit(dataset: Dataset[_]): SimpleLinearRegressionModel = {
+
+        implicit val encoder: Encoder[MlVector] = ExpressionEncoder()
+
+        val outputColumnName = "output column"
+
+        val vectors = {
+            val assembler = new VectorAssembler().setInputCols(Array($(featuresCol), $(labelCol))).setOutputCol(outputColumnName)
+
+            assembler.transform(dataset).select(outputColumnName).as[MlVector]
+        }
+
+        val weightsCount = vectors.first().size - 1
+        var previousWeights = DenseVector.fill(weightsCount, Double.PositiveInfinity)
+        val currentWeights = DenseVector.fill(weightsCount, 0d)
+
+        var currentIteration = 0
+
+        while (currentIteration < $(maxIter) && euclideanDistance(previousWeights, currentWeights) > $(tol)) {
+
+            currentIteration += 1
+
+            val summary = vectors.rdd.mapPartitions((data: Iterator[MlVector]) => {
+                val summarizer = new MultivariateOnlineSummarizer()
+
+                data.foreach(row => {
+                    val x = row.asBreeze(0 until weightsCount).toDenseVector
+                    val weightsDelta = x * (x.dot(currentWeights) - row.asBreeze(-1))
+
+                    summarizer.add(MllibVectors.fromBreeze(weightsDelta))
+                })
+
+                Iterator(summarizer)
+            }).reduce(_ merge _)
+
+            previousWeights = currentWeights.copy
+            currentWeights -= $(learningRate) * summary.mean.asBreeze
+        }
+
+        copyValues(new SimpleLinearRegressionModel(currentWeights).setParent(this))
     }
-
-    val weightSize = vectors.first().size - 1
-    var previousWeights = DenseVector.fill(weightSize, Double.PositiveInfinity)
-    val currentWeights = DenseVector.fill(weightSize, 0.0)
-
-    // scala no breakable for loops crutch
-    var iteration = 0
-    while (iteration < $(maxIter) && euclideanDistance(previousWeights, currentWeights) > $(tol)) {
-
-      val summary = vectors.rdd
-        .mapPartitions((data: Iterator[MlVector]) => {
-          val summarizer = new MultivariateOnlineSummarizer()
-
-          data.foreach(row => {
-            val x = row.asBreeze(0 until weightSize).toDenseVector
-            val weightsDelta = x * (x.dot(currentWeights) - row.asBreeze(-1))
-            summarizer.add(MllibVectors.fromBreeze(weightsDelta))
-          })
-
-          Iterator(summarizer)
-        })
-        .reduce(_ merge _)
-
-      previousWeights = currentWeights.copy
-      currentWeights -= $(learningRate) * summary.mean.asBreeze
-      iteration += 1
-    }
-
-    copyValues(new LinearRegressionModel(currentWeights).setParent(this))
-  }
-
-  override def copy(extra: ParamMap): LinearRegression = defaultCopy(extra)
-
-  override def transformSchema(schema: StructType): StructType = validateAndTransformSchema(schema)
 }
 
-object LinearRegression extends DefaultParamsReadable[LinearRegression]
+class SimpleLinearRegressionModel(override val uid: String, val weights: DenseVector[Double])
+    extends Model[SimpleLinearRegressionModel] with LinearRegressionParams with MLWritable {
 
-class LinearRegressionModel(override val uid: String, val weights: DenseVector[Double])
-  extends Model[LinearRegressionModel] with LinearRegressionParams with MLWritable {
+    def this(weights: DenseVector[Double]) = this(Identifiable.randomUID("linearRegressionModel"), weights)
 
-  def this(weights: DenseVector[Double]) = this(Identifiable.randomUID("linearRegressionModel"), weights)
+    override def copy(extra: ParamMap): SimpleLinearRegressionModel = copyValues(new SimpleLinearRegressionModel(weights), extra)
 
-  override def transform(dataset: Dataset[_]): DataFrame = {
-    val transformUdf = {
-      dataset.sqlContext.udf.register(
-        uid + "_transform",
-        (x: MlVector) => { sum(x.asBreeze.toDenseVector * weights(0 until weights.length)) },
-      )
+    override def transformSchema(schema: StructType): StructType = validateAndTransform(schema)
+
+    override def transform(dataset: Dataset[_]): DataFrame = {
+        val transformUdf = {
+            dataset.sqlContext.udf.register(
+                uid + "_transform",
+                (x: MlVector) => {
+                    sum(x.asBreeze.toDenseVector * weights(0 until weights.length))
+                }
+            )
+        }
+
+        dataset.withColumn($(predictionCol), transformUdf(dataset($(featuresCol))))
     }
-    dataset.withColumn($(predictionCol), transformUdf(dataset($(featuresCol))))
-  }
 
-  override def copy(extra: ParamMap): LinearRegressionModel = copyValues(new LinearRegressionModel(weights), extra)
+    override def write: MLWriter = new DefaultParamsWriter(this) {
 
-  override def transformSchema(schema: StructType): StructType = validateAndTransformSchema(schema)
+        override protected def saveImpl(path: String): Unit = {
+            super.saveImpl(path)
 
-  override def write: MLWriter = new DefaultParamsWriter(this) {
-    override protected def saveImpl(path: String): Unit = {
-      super.saveImpl(path)
-      val vectors = Tuple1(MlVectors.fromBreeze(weights))
-      sqlContext.createDataFrame(Seq(vectors)).write.parquet(path + "/vectors")
+            val vectors = Tuple1(MlVectors.fromBreeze(weights))
+
+            sqlContext.createDataFrame(Seq(vectors)).write.parquet(path + "/vectors")
+        }
     }
-  }
 }
 
-object LinearRegressionModel extends MLReadable[LinearRegressionModel] {
+object SimpleLinearRegressionModel extends MLReadable[SimpleLinearRegressionModel] {
 
-  override def read: MLReader[LinearRegressionModel] = new MLReader[LinearRegressionModel] {
-    override def load(path: String): LinearRegressionModel = {
-      val metadata = DefaultParamsReader.loadMetadata(path, sc)
-      val vectors = sqlContext.read.parquet(path + "/vectors")
+    override def read: MLReader[SimpleLinearRegressionModel] = new MLReader[SimpleLinearRegressionModel] {
 
-      implicit val encoder: Encoder[MlVector] = ExpressionEncoder()
+        override def load(path: String): SimpleLinearRegressionModel = {
+            val metadata = DefaultParamsReader.loadMetadata(path, sc)
+            val vectors = sqlContext.read.parquet(path + "/vectors")
 
-      val weights = vectors.select(vectors("_1").as[MlVector]).first().asBreeze.toDenseVector
-      val model = new LinearRegressionModel(weights)
-      metadata.getAndSetParams(model)
-      model
+            implicit val encoder: Encoder[MlVector] = ExpressionEncoder()
+
+            val weights = vectors.select(vectors("_1").as[MlVector]).first().asBreeze.toDenseVector
+            val model = new SimpleLinearRegressionModel(weights)
+
+            metadata.getAndSetParams(model)
+
+            return model
+        }
     }
-  }
 }
